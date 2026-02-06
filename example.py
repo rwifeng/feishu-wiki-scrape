@@ -39,7 +39,7 @@ cookies = {
 }
 
 scraper_with_auth = FeishuWikiScraper(
-    cookies=cookies if cookies.get("session_id") else None,
+    cookies=cookies if cookies else None,
     delay=1.0
 )
 

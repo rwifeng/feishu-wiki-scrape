@@ -5,8 +5,9 @@ Core scraper implementation for Feishu wiki pages
 import requests
 from bs4 import BeautifulSoup
 import html2text
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 from typing import Dict, List, Optional, Set
+from collections import deque
 import logging
 import time
 
@@ -22,6 +23,8 @@ class FeishuWikiScraper:
         cookies: Optional[Dict[str, str]] = None,
         headers: Optional[Dict[str, str]] = None,
         delay: float = 1.0,
+        timeout: float = 30.0,
+        max_redirects: int = 5,
     ):
         """
         Initialize the scraper.
@@ -30,10 +33,16 @@ class FeishuWikiScraper:
             cookies: Optional cookies for authentication
             headers: Optional custom headers
             delay: Delay between requests in seconds (default: 1.0)
+            timeout: Request timeout in seconds (default: 30.0)
+            max_redirects: Maximum number of redirects to follow (default: 5)
         """
         self.session = requests.Session()
         self.delay = delay
+        self.timeout = timeout
         self.logger = logging.getLogger(__name__)
+
+        # Set max redirects for security
+        self.session.max_redirects = max_redirects
 
         # Set default headers
         self.session.headers.update(
@@ -71,7 +80,7 @@ class FeishuWikiScraper:
         """
         try:
             self.logger.info(f"Fetching: {url}")
-            response = self.session.get(url, timeout=30)
+            response = self.session.get(url, timeout=self.timeout, verify=True)
             response.raise_for_status()
             return BeautifulSoup(response.content, "lxml")
         except requests.RequestException as e:
@@ -112,24 +121,67 @@ class FeishuWikiScraper:
                     href = link["href"]
                     # Convert relative URLs to absolute
                     absolute_url = urljoin(base_url, href)
+                    # Normalize URL to avoid duplicates
+                    normalized_url = self._normalize_url(absolute_url)
                     # Only include wiki links from the same domain
-                    if self._is_same_domain(absolute_url, base_url) and "/wiki/" in absolute_url:
-                        links.add(absolute_url)
-
-        # Also look for links in the main content that might be internal wiki links
-        main_content = soup.find("main") or soup.find("article") or soup.find("body")
-        if main_content:
-            for link in main_content.find_all("a", href=True):
-                href = link["href"]
-                absolute_url = urljoin(base_url, href)
-                if self._is_same_domain(absolute_url, base_url) and "/wiki/" in absolute_url:
-                    links.add(absolute_url)
+                    if self._is_same_domain(normalized_url, base_url) and "/wiki/" in normalized_url:
+                        links.add(normalized_url)
 
         return list(links)
 
     def _is_same_domain(self, url1: str, url2: str) -> bool:
         """Check if two URLs are from the same domain."""
         return urlparse(url1).netloc == urlparse(url2).netloc
+
+    def _normalize_url(self, url: str) -> str:
+        """
+        Normalize URL by removing fragments and sorting query parameters.
+        This helps avoid scraping the same page multiple times.
+        
+        Args:
+            url: URL to normalize
+            
+        Returns:
+            Normalized URL string
+        """
+        parsed = urlparse(url)
+        # Remove fragment and reconstruct URL
+        normalized = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            ''  # Remove fragment
+        ))
+        return normalized
+
+    def _validate_url(self, url: str) -> bool:
+        """
+        Validate that the URL is properly formatted and is a Feishu wiki URL.
+        
+        Args:
+            url: URL to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        try:
+            parsed = urlparse(url)
+            # Check basic URL structure
+            if not parsed.scheme or not parsed.netloc:
+                self.logger.error(f"Invalid URL format: {url}")
+                return False
+            # Check if it's a Feishu domain
+            if "feishu.cn" not in parsed.netloc:
+                self.logger.warning(f"URL does not appear to be a Feishu domain: {url}")
+            # Check if it's a wiki URL
+            if "/wiki/" not in parsed.path:
+                self.logger.warning(f"URL does not appear to be a wiki page: {url}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error validating URL {url}: {e}")
+            return False
 
     def extract_content(self, soup: BeautifulSoup) -> str:
         """
@@ -183,21 +235,29 @@ class FeishuWikiScraper:
         try:
             markdown = self.html2text.handle(html_content)
             return markdown.strip()
-        except Exception as e:
-            self.logger.error(f"Error converting HTML to Markdown: {e}")
+        except Exception:
+            self.logger.exception("Error converting HTML to Markdown")
             return ""
 
-    def scrape_page(self, url: str) -> Optional[Dict[str, str]]:
+    def scrape_page(self, url: str, soup: Optional[BeautifulSoup] = None) -> Optional[Dict[str, str]]:
         """
         Scrape a single page and return its content as Markdown.
 
         Args:
             url: URL of the page to scrape
+            soup: Optional pre-fetched BeautifulSoup object to avoid re-fetching
 
         Returns:
-            Dictionary with 'url', 'title', and 'markdown' keys, or None if failed
+            Dictionary with 'url', 'title', 'markdown', and 'soup' keys, or None if failed
         """
-        soup = self.fetch_page(url)
+        # Validate URL
+        if not self._validate_url(url):
+            return None
+            
+        # Fetch page if not provided
+        if soup is None:
+            soup = self.fetch_page(url)
+        
         if not soup:
             return None
 
@@ -213,7 +273,28 @@ class FeishuWikiScraper:
             "url": url,
             "title": title,
             "markdown": markdown,
+            "soup": soup,  # Include soup for potential reuse
         }
+
+    def _format_pages_to_markdown(self, results: List[Dict[str, str]]) -> str:
+        """
+        Format a list of page results into a single Markdown string.
+        
+        Args:
+            results: List of page dictionaries with 'title', 'url', and 'markdown' keys
+            
+        Returns:
+            Formatted Markdown string
+        """
+        output = []
+        for i, page in enumerate(results):
+            if i > 0:
+                output.append("\n\n---\n\n")
+            output.append(f"# {page['title']}\n\n")
+            output.append(f"Source: {page['url']}\n\n")
+            output.append(page["markdown"])
+            output.append("\n")
+        return "".join(output)
 
     def scrape_wiki(
         self,
@@ -232,37 +313,48 @@ class FeishuWikiScraper:
         Returns:
             List of dictionaries, each containing 'url', 'title', and 'markdown' for a page
         """
+        # Normalize the start URL
+        start_url = self._normalize_url(start_url)
+        
         visited: Set[str] = set()
-        to_visit: List[str] = [start_url]
+        to_visit: deque = deque([start_url])
         results: List[Dict[str, str]] = []
 
-        while to_visit and (max_pages is None or len(results) < max_pages):
-            url = to_visit.pop(0)
+        try:
+            while to_visit and (max_pages is None or len(results) < max_pages):
+                url = to_visit.popleft()
 
-            if url in visited:
-                continue
+                if url in visited:
+                    continue
 
-            visited.add(url)
+                visited.add(url)
 
-            # Scrape the page
-            page_data = self.scrape_page(url)
-            if page_data:
-                results.append(page_data)
-                self.logger.info(f"Scraped: {page_data['title']} ({len(results)} pages)")
+                # Scrape the page
+                page_data = self.scrape_page(url)
+                if page_data:
+                    # Extract soup before adding to results (to avoid including it in output)
+                    soup = page_data.pop("soup", None)
+                    results.append(page_data)
+                    self.logger.info(f"Scraped: {page_data['title']} ({len(results)} pages)")
 
-                # Find more links if include_sidebar is True
-                if include_sidebar and (max_pages is None or len(results) < max_pages):
-                    soup = self.fetch_page(url)
-                    if soup:
-                        new_links = self.extract_sidebar_links(soup, url)
-                        for link in new_links:
-                            if link not in visited and link not in to_visit:
-                                to_visit.append(link)
-                                self.logger.debug(f"Added to queue: {link}")
+                    # Find more links if include_sidebar is True
+                    if include_sidebar and (max_pages is None or len(results) < max_pages):
+                        if soup:
+                            new_links = self.extract_sidebar_links(soup, url)
+                            for link in new_links:
+                                # Normalize link before checking
+                                normalized_link = self._normalize_url(link)
+                                if normalized_link not in visited and normalized_link not in to_visit:
+                                    to_visit.append(normalized_link)
+                                    self.logger.debug(f"Added to queue: {normalized_link}")
 
-            # Be polite with delays
-            if to_visit:
-                time.sleep(self.delay)
+                # Be polite with delays
+                if to_visit:
+                    time.sleep(self.delay)
+        except KeyboardInterrupt:
+            self.logger.info(
+                "Scraping interrupted by user. Returning results collected so far."
+            )
 
         self.logger.info(f"Scraping complete. Total pages: {len(results)}")
         return results
@@ -285,13 +377,10 @@ class FeishuWikiScraper:
         """
         results = self.scrape_wiki(start_url, max_pages, include_sidebar)
 
-        with open(output_file, "w", encoding="utf-8") as f:
-            for i, page in enumerate(results):
-                if i > 0:
-                    f.write("\n\n---\n\n")
-                f.write(f"# {page['title']}\n\n")
-                f.write(f"Source: {page['url']}\n\n")
-                f.write(page["markdown"])
-                f.write("\n")
-
-        self.logger.info(f"Saved {len(results)} pages to {output_file}")
+        try:
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(self._format_pages_to_markdown(results))
+            self.logger.info(f"Saved {len(results)} pages to {output_file}")
+        except OSError as e:
+            self.logger.error(f"Failed to write output file '{output_file}': {e}")
+            raise

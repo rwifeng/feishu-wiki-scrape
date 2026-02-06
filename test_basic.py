@@ -63,8 +63,8 @@ def test_url_domain_check():
     url2 = "https://example.feishu.cn/wiki/page2"
     url3 = "https://other.feishu.cn/wiki/page1"
     
-    assert scraper._is_same_domain(url1, url2) == True
-    assert scraper._is_same_domain(url1, url3) == False
+    assert scraper._is_same_domain(url1, url2)
+    assert not scraper._is_same_domain(url1, url3)
     
     print("✓ Domain checking works")
 
@@ -95,7 +95,7 @@ def test_content_extraction():
     assert "Main Content" in content
     assert "main content" in content.lower()
     # Navigation and footer should be removed
-    assert "Navigation" not in content or "<nav>" not in content
+    assert "Navigation" not in content and "<nav" not in content
     
     print("✓ Content extraction works")
 

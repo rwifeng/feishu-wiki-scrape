@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name="feishu-wiki-scrape",
     version="0.1.0",
-    author="feishu-wiki-scrape",
+    author="rwifeng",
     description="A Python library to scrape Feishu wiki pages and convert them to Markdown",
     long_description=long_description,
     long_description_content_type="text/markdown",

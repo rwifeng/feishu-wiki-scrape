@@ -18,6 +18,17 @@ def setup_logging(verbose: bool):
     )
 
 
+def validate_positive_float(value):
+    """Validate that a value is a positive float."""
+    try:
+        fvalue = float(value)
+        if fvalue <= 0:
+            raise argparse.ArgumentTypeError(f"{value} must be a positive number")
+        return fvalue
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} is not a valid number")
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -43,7 +54,7 @@ def main():
     )
     parser.add_argument(
         "--delay",
-        type=float,
+        type=validate_positive_float,
         default=1.0,
         help="Delay between requests in seconds (default: 1.0)",
     )
@@ -109,16 +120,13 @@ def main():
             print(json.dumps(results, indent=2, ensure_ascii=False))
         else:
             # Save to Markdown file
-            with open(args.output, "w", encoding="utf-8") as f:
-                for i, page in enumerate(results):
-                    if i > 0:
-                        f.write("\n\n---\n\n")
-                    f.write(f"# {page['title']}\n\n")
-                    f.write(f"Source: {page['url']}\n\n")
-                    f.write(page["markdown"])
-                    f.write("\n")
-
-            print(f"Successfully scraped {len(results)} pages to {args.output}")
+            try:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    f.write(scraper._format_pages_to_markdown(results))
+                print(f"Successfully scraped {len(results)} pages to {args.output}")
+            except OSError as e:
+                print(f"Error writing to output file '{args.output}': {e}", file=sys.stderr)
+                return 1
 
         return 0
 
