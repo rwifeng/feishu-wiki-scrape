@@ -242,11 +242,11 @@ class FeishuWikiScraper:
             soup: Optional pre-fetched BeautifulSoup object to avoid re-fetching
 
         Returns:
-            Dictionary with 'url', 'title', and 'markdown' keys, or None if failed
+            Dictionary with 'url', 'title', and 'markdown' keys (and internal '_soup' key), 
+            or None if failed
         """
         # Validate URL
         if not self._validate_url(url):
-            self.logger.error(f"URL validation failed for: {url}")
             return None
             
         # Fetch page if not provided
@@ -268,7 +268,7 @@ class FeishuWikiScraper:
             "url": url,
             "title": title,
             "markdown": markdown,
-            "_soup": soup,  # Internal use only, prefixed with underscore
+            "_soup": soup,  # Internal use only, not part of public API
         }
 
     def format_pages_to_markdown(self, results: List[Dict[str, str]]) -> str:
@@ -329,8 +329,9 @@ class FeishuWikiScraper:
                 # Scrape the page
                 page_data = self.scrape_page(url)
                 if page_data:
-                    # Extract soup for internal use (don't include in results)
+                    # Extract soup for internal use and remove from results
                     soup = page_data.pop("_soup", None)
+                    # Now append to results without _soup
                     results.append(page_data)
                     self.logger.info(f"Scraped: {page_data['title']} ({len(results)} pages)")
 
