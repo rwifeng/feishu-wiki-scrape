@@ -11,6 +11,7 @@ A Python library to scrape Feishu (飞书) wiki pages and convert them to Markdo
 - ⚙️ Configurable scraping options (delays, max pages, etc.)
 - 💾 Export to Markdown files or JSON format
 - 🎯 Command-line interface for easy usage
+- 🔥 **Firecrawl-compatible JSON output with metadata**
 
 ## Installation
 
@@ -47,6 +48,7 @@ feishu-wiki-scrape https://zcn3fx96oxg4.feishu.cn/wiki/H5V5wMczPif5A5khSG3cWx65n
 - `--cookies`: Cookies as JSON string for authentication
 - `--headers`: Custom headers as JSON string
 - `--json-output`: Output as JSON instead of Markdown file
+- `--firecrawl-format`: Output in Firecrawl-compatible JSON format with metadata
 - `-v, --verbose`: Enable verbose logging
 
 #### Examples
@@ -113,6 +115,72 @@ scraper.scrape_to_file(
     include_sidebar=True
 )
 ```
+
+### Firecrawl-Compatible Output
+
+This library supports Firecrawl-compatible JSON output with rich metadata, making it easy to build API-compatible tools.
+
+#### Using CLI
+
+```bash
+feishu-wiki-scrape https://example.feishu.cn/wiki/page \
+  --firecrawl-format \
+  --max-pages 10 > output.json
+```
+
+Output format:
+```json
+{
+  "success": true,
+  "status": "completed",
+  "completed": 10,
+  "total": 10,
+  "data": [
+    {
+      "markdown": "# Page Title\n\nPage content...",
+      "metadata": {
+        "url": "https://example.feishu.cn/wiki/page",
+        "title": "Page Title",
+        "keywords": "keyword1, keyword2",
+        "language": "zh-CN",
+        "sourceURL": "https://example.feishu.cn/wiki/page",
+        "statusCode": 200,
+        "contentType": "text/html; charset=utf-8",
+        "description": "Page description"
+      }
+    }
+  ]
+}
+```
+
+#### Using Python API
+
+```python
+from feishu_wiki_scrape import FeishuWikiScraper
+
+scraper = FeishuWikiScraper()
+
+# Scrape with metadata
+results = scraper.scrape_wiki_with_metadata(
+    start_url="https://example.feishu.cn/wiki/page",
+    max_pages=10,
+    include_sidebar=True
+)
+
+# Format as Firecrawl response
+simple_results = [
+    {"url": r["metadata"]["url"], 
+     "title": r["metadata"]["title"], 
+     "markdown": r["markdown"]}
+    for r in results
+]
+firecrawl_response = scraper.format_as_firecrawl(simple_results, start_url)
+firecrawl_response["data"] = results  # Use full metadata
+
+print(firecrawl_response)
+```
+
+For a complete example of building a Firecrawl-compatible API, see `example_firecrawl.py`.
 
 ## How It Works
 

@@ -6,7 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 import html2text
 from urllib.parse import urljoin, urlparse, urlunparse
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 from collections import deque
 import logging
 import time
@@ -271,6 +271,90 @@ class FeishuWikiScraper:
             "_soup": soup,  # Internal use only, not part of public API
         }
 
+    def _extract_metadata(self, url: str, soup: BeautifulSoup, title: str) -> Dict[str, Any]:
+        """
+        Extract metadata from a page for Firecrawl-compatible format.
+        
+        Args:
+            url: Page URL
+            soup: BeautifulSoup object
+            title: Page title
+            
+        Returns:
+            Dictionary with metadata fields
+        """
+        metadata = {
+            "url": url,
+            "title": title,
+            "sourceURL": url,
+            "statusCode": 200,  # Assumed success if we got here
+        }
+        
+        # Extract meta tags
+        meta_tags = soup.find_all("meta")
+        for meta in meta_tags:
+            name = meta.get("name", "").lower()
+            property_attr = meta.get("property", "").lower()
+            content = meta.get("content", "")
+            
+            if name == "keywords":
+                metadata["keywords"] = content
+            elif name == "description" or property_attr == "og:description":
+                metadata["description"] = content
+            elif property_attr == "og:type":
+                metadata["ogType"] = content
+            elif property_attr == "og:image":
+                metadata["ogImage"] = content
+                
+        # Try to detect language
+        html_tag = soup.find("html")
+        if html_tag and html_tag.get("lang"):
+            metadata["language"] = html_tag.get("lang")
+        
+        # Set content type
+        metadata["contentType"] = "text/html; charset=utf-8"
+        
+        return metadata
+
+    def scrape_page_with_metadata(self, url: str, soup: Optional[BeautifulSoup] = None) -> Optional[Dict[str, Any]]:
+        """
+        Scrape a single page and return its content with metadata in Firecrawl-compatible format.
+
+        Args:
+            url: URL of the page to scrape
+            soup: Optional pre-fetched BeautifulSoup object to avoid re-fetching
+
+        Returns:
+            Dictionary with 'markdown' and 'metadata' keys, or None if failed
+        """
+        # Validate URL
+        if not self._validate_url(url):
+            return None
+            
+        # Fetch page if not provided
+        if soup is None:
+            soup = self.fetch_page(url)
+        
+        if not soup:
+            return None
+
+        # Extract title
+        title_tag = soup.find("title")
+        title = title_tag.get_text().strip() if title_tag else "Untitled"
+
+        # Extract and convert content
+        html_content = self.extract_content(soup)
+        markdown = self.html_to_markdown(html_content)
+        
+        # Extract metadata
+        metadata = self._extract_metadata(url, soup, title)
+
+        return {
+            "markdown": markdown,
+            "metadata": metadata,
+            "_soup": soup,  # Internal use only
+        }
+
     def format_pages_to_markdown(self, results: List[Dict[str, str]]) -> str:
         """
         Format a list of page results into a single Markdown string.
@@ -341,6 +425,111 @@ class FeishuWikiScraper:
                             new_links = self.extract_sidebar_links(soup, url)
                             for link in new_links:
                                 # Normalize link before checking
+                                normalized_link = self._normalize_url(link)
+                                if normalized_link not in visited and normalized_link not in to_visit_set:
+                                    to_visit_queue.append(normalized_link)
+                                    to_visit_set.add(normalized_link)
+                                    self.logger.debug(f"Added to queue: {normalized_link}")
+
+                # Be polite with delays
+                if to_visit_queue:
+                    time.sleep(self.delay)
+        except KeyboardInterrupt:
+            self.logger.info(
+                "Scraping interrupted by user. Returning results collected so far."
+            )
+
+        self.logger.info(f"Scraping complete. Total pages: {len(results)}")
+        return results
+
+    def format_as_firecrawl(
+        self,
+        results: List[Dict[str, str]],
+        start_url: str,
+        status: str = "completed",
+    ) -> Dict[str, Any]:
+        """
+        Format scraping results in Firecrawl-compatible JSON format.
+        
+        Args:
+            results: List of page dictionaries with 'url', 'title', and 'markdown' keys
+            start_url: The starting URL that was scraped
+            status: Status of the scraping operation (default: "completed")
+            
+        Returns:
+            Dictionary in Firecrawl-compatible format with success, status, data, etc.
+        """
+        # Convert simple format to Firecrawl format with metadata
+        data = []
+        for page in results:
+            data.append({
+                "markdown": page.get("markdown", ""),
+                "metadata": {
+                    "url": page.get("url", ""),
+                    "title": page.get("title", "Untitled"),
+                    "sourceURL": page.get("url", ""),
+                    "statusCode": 200,
+                    "contentType": "text/html; charset=utf-8",
+                }
+            })
+        
+        return {
+            "success": True,
+            "status": status,
+            "completed": len(results),
+            "total": len(results),
+            "data": data,
+        }
+
+    def scrape_wiki_with_metadata(
+        self,
+        start_url: str,
+        max_pages: Optional[int] = None,
+        include_sidebar: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Scrape an entire wiki site with full metadata in Firecrawl-compatible format.
+
+        Args:
+            start_url: Starting URL of the wiki
+            max_pages: Maximum number of pages to scrape (None for unlimited)
+            include_sidebar: Whether to follow sidebar links (default: True)
+
+        Returns:
+            List of dictionaries with 'markdown' and 'metadata' keys
+        """
+        # Normalize the start URL
+        start_url = self._normalize_url(start_url)
+        
+        visited: Set[str] = set()
+        to_visit_queue: deque = deque([start_url])
+        to_visit_set: Set[str] = {start_url}
+        results: List[Dict[str, Any]] = []
+
+        try:
+            while to_visit_queue and (max_pages is None or len(results) < max_pages):
+                url = to_visit_queue.popleft()
+                to_visit_set.discard(url)
+
+                if url in visited:
+                    continue
+
+                visited.add(url)
+
+                # Scrape the page with metadata
+                page_data = self.scrape_page_with_metadata(url)
+                if page_data:
+                    # Extract soup for internal use
+                    soup = page_data.pop("_soup", None)
+                    results.append(page_data)
+                    title = page_data.get("metadata", {}).get("title", "Untitled")
+                    self.logger.info(f"Scraped: {title} ({len(results)} pages)")
+
+                    # Find more links if include_sidebar is True
+                    if include_sidebar and (max_pages is None or len(results) < max_pages):
+                        if soup:
+                            new_links = self.extract_sidebar_links(soup, url)
+                            for link in new_links:
                                 normalized_link = self._normalize_url(link)
                                 if normalized_link not in visited and normalized_link not in to_visit_set:
                                     to_visit_queue.append(normalized_link)
