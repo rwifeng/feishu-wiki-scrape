@@ -122,7 +122,7 @@ def main():
             # Save to Markdown file
             try:
                 with open(args.output, "w", encoding="utf-8") as f:
-                    f.write(scraper._format_pages_to_markdown(results))
+                    f.write(scraper.format_pages_to_markdown(results))
                 print(f"Successfully scraped {len(results)} pages to {args.output}")
             except OSError as e:
                 print(f"Error writing to output file '{args.output}': {e}", file=sys.stderr)

@@ -158,7 +158,7 @@ class FeishuWikiScraper:
 
     def _validate_url(self, url: str) -> bool:
         """
-        Validate that the URL is properly formatted and is a Feishu wiki URL.
+        Validate that the URL is properly formatted.
         
         Args:
             url: URL to validate
@@ -172,12 +172,6 @@ class FeishuWikiScraper:
             if not parsed.scheme or not parsed.netloc:
                 self.logger.error(f"Invalid URL format: {url}")
                 return False
-            # Check if it's a Feishu domain
-            if "feishu.cn" not in parsed.netloc:
-                self.logger.warning(f"URL does not appear to be a Feishu domain: {url}")
-            # Check if it's a wiki URL
-            if "/wiki/" not in parsed.path:
-                self.logger.warning(f"URL does not appear to be a wiki page: {url}")
             return True
         except Exception as e:
             self.logger.error(f"Error validating URL {url}: {e}")
@@ -248,10 +242,11 @@ class FeishuWikiScraper:
             soup: Optional pre-fetched BeautifulSoup object to avoid re-fetching
 
         Returns:
-            Dictionary with 'url', 'title', 'markdown', and 'soup' keys, or None if failed
+            Dictionary with 'url', 'title', and 'markdown' keys, or None if failed
         """
         # Validate URL
         if not self._validate_url(url):
+            self.logger.error(f"URL validation failed for: {url}")
             return None
             
         # Fetch page if not provided
@@ -273,10 +268,10 @@ class FeishuWikiScraper:
             "url": url,
             "title": title,
             "markdown": markdown,
-            "soup": soup,  # Include soup for potential reuse
+            "_soup": soup,  # Internal use only, prefixed with underscore
         }
 
-    def _format_pages_to_markdown(self, results: List[Dict[str, str]]) -> str:
+    def format_pages_to_markdown(self, results: List[Dict[str, str]]) -> str:
         """
         Format a list of page results into a single Markdown string.
         
@@ -317,12 +312,14 @@ class FeishuWikiScraper:
         start_url = self._normalize_url(start_url)
         
         visited: Set[str] = set()
-        to_visit: deque = deque([start_url])
+        to_visit_queue: deque = deque([start_url])
+        to_visit_set: Set[str] = {start_url}  # For O(1) membership checking
         results: List[Dict[str, str]] = []
 
         try:
-            while to_visit and (max_pages is None or len(results) < max_pages):
-                url = to_visit.popleft()
+            while to_visit_queue and (max_pages is None or len(results) < max_pages):
+                url = to_visit_queue.popleft()
+                to_visit_set.discard(url)
 
                 if url in visited:
                     continue
@@ -332,8 +329,8 @@ class FeishuWikiScraper:
                 # Scrape the page
                 page_data = self.scrape_page(url)
                 if page_data:
-                    # Extract soup before adding to results (to avoid including it in output)
-                    soup = page_data.pop("soup", None)
+                    # Extract soup for internal use (don't include in results)
+                    soup = page_data.pop("_soup", None)
                     results.append(page_data)
                     self.logger.info(f"Scraped: {page_data['title']} ({len(results)} pages)")
 
@@ -344,12 +341,13 @@ class FeishuWikiScraper:
                             for link in new_links:
                                 # Normalize link before checking
                                 normalized_link = self._normalize_url(link)
-                                if normalized_link not in visited and normalized_link not in to_visit:
-                                    to_visit.append(normalized_link)
+                                if normalized_link not in visited and normalized_link not in to_visit_set:
+                                    to_visit_queue.append(normalized_link)
+                                    to_visit_set.add(normalized_link)
                                     self.logger.debug(f"Added to queue: {normalized_link}")
 
                 # Be polite with delays
-                if to_visit:
+                if to_visit_queue:
                     time.sleep(self.delay)
         except KeyboardInterrupt:
             self.logger.info(
@@ -379,7 +377,7 @@ class FeishuWikiScraper:
 
         try:
             with open(output_file, "w", encoding="utf-8") as f:
-                f.write(self._format_pages_to_markdown(results))
+                f.write(self.format_pages_to_markdown(results))
             self.logger.info(f"Saved {len(results)} pages to {output_file}")
         except OSError as e:
             self.logger.error(f"Failed to write output file '{output_file}': {e}")
