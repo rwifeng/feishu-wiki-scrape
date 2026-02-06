@@ -114,11 +114,9 @@ class FeishuWikiScraper:
         ]
 
         # First, try to find links in sidebar elements
-        sidebar_found = False
         for selector in sidebar_selectors:
             sidebar_elements = soup.select(selector)
             if sidebar_elements:
-                sidebar_found = True
                 for element in sidebar_elements:
                     # Find all links in the sidebar
                     for link in element.find_all("a", href=True):
