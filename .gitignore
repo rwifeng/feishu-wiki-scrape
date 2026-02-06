@@ -132,8 +132,8 @@ dmypy.json
 # Output files
 output.md
 output.json
-*.md
-!README.md
+wiki_*.md
+feishu_wiki_output.md
 
 # Temporary files
 /tmp/
