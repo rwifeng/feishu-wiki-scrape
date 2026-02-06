@@ -113,19 +113,37 @@ class FeishuWikiScraper:
             '[class*="menu"]',
         ]
 
+        # First, try to find links in sidebar elements
+        sidebar_found = False
         for selector in sidebar_selectors:
             sidebar_elements = soup.select(selector)
-            for element in sidebar_elements:
-                # Find all links in the sidebar
-                for link in element.find_all("a", href=True):
-                    href = link["href"]
-                    # Convert relative URLs to absolute
-                    absolute_url = urljoin(base_url, href)
-                    # Normalize URL to avoid duplicates
-                    normalized_url = self._normalize_url(absolute_url)
-                    # Only include wiki links from the same domain
-                    if self._is_same_domain(normalized_url, base_url) and "/wiki/" in normalized_url:
-                        links.add(normalized_url)
+            if sidebar_elements:
+                sidebar_found = True
+                for element in sidebar_elements:
+                    # Find all links in the sidebar
+                    for link in element.find_all("a", href=True):
+                        href = link["href"]
+                        # Convert relative URLs to absolute
+                        absolute_url = urljoin(base_url, href)
+                        # Normalize URL to avoid duplicates
+                        normalized_url = self._normalize_url(absolute_url)
+                        # Only include wiki links from the same domain
+                        if self._is_same_domain(normalized_url, base_url) and "/wiki/" in normalized_url:
+                            links.add(normalized_url)
+        
+        # If no sidebar links found, fall back to searching the entire page
+        # This helps when the HTML structure doesn't match expected selectors
+        if not links:
+            self.logger.debug("No sidebar links found, searching entire page for wiki links")
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
+                # Convert relative URLs to absolute
+                absolute_url = urljoin(base_url, href)
+                # Normalize URL to avoid duplicates
+                normalized_url = self._normalize_url(absolute_url)
+                # Only include wiki links from the same domain
+                if self._is_same_domain(normalized_url, base_url) and "/wiki/" in normalized_url:
+                    links.add(normalized_url)
 
         return list(links)
 
