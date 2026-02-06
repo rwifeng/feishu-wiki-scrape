@@ -90,6 +90,7 @@ class FeishuWikiScraper:
     def extract_sidebar_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
         """
         Extract all wiki page links from the sidebar navigation.
+        First tries Feishu API, then falls back to HTML parsing.
 
         Args:
             soup: BeautifulSoup object of the page
@@ -98,6 +99,13 @@ class FeishuWikiScraper:
         Returns:
             List of absolute URLs found in the sidebar
         """
+        # First try the Feishu wiki tree API
+        if 'feishu.cn' in base_url or 'larksuite.com' in base_url:
+            api_links = self.extract_feishu_wiki_links(soup, base_url)
+            if api_links:
+                return api_links
+            self.logger.warning("Feishu API failed, falling back to HTML parsing")
+
         links = set()
 
         # Look for common sidebar/navigation selectors in Feishu wiki pages
@@ -127,11 +135,286 @@ class FeishuWikiScraper:
                     if self._is_same_domain(normalized_url, base_url) and "/wiki/" in normalized_url:
                         links.add(normalized_url)
 
+        # Also extract wiki links from page content (for Feishu pages with internal links)
+        content_links = self._extract_content_wiki_links(soup, base_url)
+        links.update(content_links)
+
         return list(links)
+
+    def _extract_content_wiki_links(self, soup: BeautifulSoup, base_url: str) -> Set[str]:
+        """
+        Extract wiki links from the main page content.
+        
+        Args:
+            soup: BeautifulSoup object of the page
+            base_url: Base URL for resolving relative links
+            
+        Returns:
+            Set of wiki page URLs found in content
+        """
+        import re
+        links = set()
+        parsed_base = urlparse(base_url)
+        
+        # Find all links in the page that point to wiki pages
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            # Handle both absolute and relative URLs
+            if '/wiki/' in href:
+                absolute_url = urljoin(base_url, href)
+                normalized_url = self._normalize_url(absolute_url)
+                if self._is_same_domain(normalized_url, base_url):
+                    links.add(normalized_url)
+        
+        # Also look for wiki tokens in scripts (for dynamically loaded content)
+        wiki_token_pattern = re.compile(r'["\']?wiki_token["\']?\s*[:=]\s*["\']([A-Za-z0-9]+)["\']')
+        obj_token_pattern = re.compile(r'["\']?obj_token["\']?\s*[:=]\s*["\']([A-Za-z0-9]+)["\']')
+        
+        for script in soup.find_all('script'):
+            script_text = script.string or ''
+            
+            for match in wiki_token_pattern.finditer(script_text):
+                token = match.group(1)
+                url = f"{parsed_base.scheme}://{parsed_base.netloc}/wiki/{token}"
+                links.add(url)
+                
+            for match in obj_token_pattern.finditer(script_text):
+                token = match.group(1)
+                # Only add if it looks like a wiki token (24+ chars)
+                if len(token) >= 20:
+                    url = f"{parsed_base.scheme}://{parsed_base.netloc}/wiki/{token}"
+                    links.add(url)
+        
+        return links
 
     def _is_same_domain(self, url1: str, url2: str) -> bool:
         """Check if two URLs are from the same domain."""
         return urlparse(url1).netloc == urlparse(url2).netloc
+
+    def _extract_wiki_token(self, url: str) -> Optional[str]:
+        """
+        Extract wiki token from Feishu URL.
+        
+        Args:
+            url: Feishu wiki URL
+            
+        Returns:
+            Wiki token string or None
+        """
+        parsed = urlparse(url)
+        path_parts = parsed.path.split('/')
+        # URL format: /wiki/{wiki_token}
+        if 'wiki' in path_parts:
+            wiki_index = path_parts.index('wiki')
+            if wiki_index + 1 < len(path_parts):
+                return path_parts[wiki_index + 1]
+        return None
+
+    def _extract_space_id_from_page(self, soup: BeautifulSoup) -> Optional[str]:
+        """
+        Extract space_id from page HTML or scripts.
+        
+        Args:
+            soup: BeautifulSoup object of the page
+            
+        Returns:
+            Space ID string or None
+        """
+        import re
+        import json
+        
+        # Look for space_id in script tags
+        for script in soup.find_all('script'):
+            script_text = script.string or ''
+            
+            # Try to find space_id in various formats
+            # Pattern 1: "space_id":"xxxxx" or 'space_id':'xxxxx'
+            match = re.search(r'["\']space_id["\']:\s*["\'](\d+)["\']', script_text)
+            if match:
+                return match.group(1)
+            
+            # Pattern 2: spaceId: "xxxxx" or spaceId: 'xxxxx'
+            match = re.search(r'spaceId:\s*["\'](\d+)["\']', script_text)
+            if match:
+                return match.group(1)
+            
+            # Pattern 3: "spaceId":"xxxxx"
+            match = re.search(r'["\']spaceId["\']:\s*["\'](\d+)["\']', script_text)
+            if match:
+                return match.group(1)
+                
+        return None
+
+    def _fetch_wiki_tree(self, base_url: str, space_id: str, wiki_token: str) -> List[str]:
+        """
+        Fetch wiki tree from Feishu API to get all page links.
+        
+        Args:
+            base_url: Base URL of the Feishu domain
+            space_id: Space ID
+            wiki_token: Wiki token of the starting page
+            
+        Returns:
+            List of wiki page URLs
+        """
+        parsed = urlparse(base_url)
+        api_url = f"{parsed.scheme}://{parsed.netloc}/space/api/wiki/v2/tree/get_info/"
+        
+        params = {
+            'space_id': space_id,
+            'with_space': 'true',
+            'with_perm': 'true',
+            'expand_shortcut': 'true',
+            'need_shared': 'true',
+            'exclude_fields': '5',
+            'with_deleted': 'true',
+            'wiki_token': wiki_token,
+        }
+        
+        try:
+            self.logger.info(f"Fetching wiki tree from API: {api_url}")
+            response = self.session.get(api_url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Log the response for debugging
+            self.logger.debug(f"Wiki tree API response: {data}")
+            
+            # Check for API error (e.g., login required)
+            code = data.get('code')
+            if code is not None and code != 0:
+                self.logger.warning(f"Wiki tree API error: code={code}, msg={data.get('msg')}. Authentication may be required.")
+                return []
+            
+            # Extract all wiki tokens from the tree
+            urls = self._parse_wiki_tree(data, parsed.scheme, parsed.netloc)
+            self.logger.info(f"Found {len(urls)} pages in wiki tree")
+            return urls
+            
+        except requests.RequestException as e:
+            self.logger.warning(f"Failed to fetch wiki tree API: {e}")
+            return []
+        except (ValueError, KeyError) as e:
+            self.logger.warning(f"Failed to parse wiki tree response: {e}")
+            return []
+
+    def _parse_wiki_tree(self, data: Dict, scheme: str, netloc: str) -> List[str]:
+        """
+        Parse wiki tree API response to extract all page URLs.
+        
+        Args:
+            data: API response data
+            scheme: URL scheme (http/https)
+            netloc: Domain name
+            
+        Returns:
+            List of wiki page URLs
+        """
+        urls = []
+        seen_tokens = set()
+        
+        def add_token(token: str):
+            """Add a wiki token as URL if not already seen."""
+            if token and token not in seen_tokens:
+                seen_tokens.add(token)
+                url = f"{scheme}://{netloc}/wiki/{token}"
+                urls.append(url)
+        
+        # Navigate to the tree data
+        tree_data = data.get('data', {}).get('tree', {})
+        if not tree_data:
+            # Fallback to old method if structure is different
+            return self._parse_wiki_tree_fallback(data, scheme, netloc)
+        
+        # Extract from root_list (list of wiki_token strings)
+        root_list = tree_data.get('root_list', [])
+        for token in root_list:
+            if isinstance(token, str):
+                add_token(token)
+        
+        # Extract from child_map (dict mapping parent to list of child tokens)
+        child_map = tree_data.get('child_map', {})
+        for parent_token, children in child_map.items():
+            add_token(parent_token)
+            for child_token in children:
+                if isinstance(child_token, str):
+                    add_token(child_token)
+        
+        # Extract from nodes (dict mapping wiki_token to node details)
+        nodes = tree_data.get('nodes', {})
+        for token, node_info in nodes.items():
+            add_token(token)
+            # Also get the url if available
+            if isinstance(node_info, dict):
+                node_url = node_info.get('url', '')
+                if node_url and '/wiki/' in node_url:
+                    # Extract token from URL
+                    url_token = node_url.split('/wiki/')[-1].split('?')[0].split('#')[0]
+                    add_token(url_token)
+        
+        return urls
+    
+    def _parse_wiki_tree_fallback(self, data: Dict, scheme: str, netloc: str) -> List[str]:
+        """
+        Fallback method for parsing wiki tree with unknown structure.
+        
+        Args:
+            data: API response data
+            scheme: URL scheme (http/https)
+            netloc: Domain name
+            
+        Returns:
+            List of wiki page URLs
+        """
+        urls = []
+        
+        def extract_nodes(node):
+            """Recursively extract wiki tokens from tree nodes."""
+            if isinstance(node, dict):
+                # Check for wiki_token or obj_token
+                wiki_token = node.get('wiki_token') or node.get('obj_token') or node.get('token')
+                if wiki_token:
+                    url = f"{scheme}://{netloc}/wiki/{wiki_token}"
+                    if url not in urls:
+                        urls.append(url)
+                
+                # Check for children
+                children = node.get('children') or node.get('nodes') or node.get('items') or []
+                for child in children:
+                    extract_nodes(child)
+                    
+                # Also check for tree/data/nodes structures
+                for key in ['tree', 'data', 'nodes', 'wiki_nodes', 'space_info']:
+                    if key in node:
+                        extract_nodes(node[key])
+                        
+            elif isinstance(node, list):
+                for item in node:
+                    extract_nodes(item)
+        
+        extract_nodes(data)
+        return urls
+
+    def extract_feishu_wiki_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
+        """
+        Extract wiki page links using Feishu API.
+        
+        Args:
+            soup: BeautifulSoup object of the page
+            base_url: Base URL of the wiki
+            
+        Returns:
+            List of wiki page URLs
+        """
+        wiki_token = self._extract_wiki_token(base_url)
+        space_id = self._extract_space_id_from_page(soup)
+        
+        if wiki_token and space_id:
+            self.logger.info(f"Found space_id: {space_id}, wiki_token: {wiki_token}")
+            return self._fetch_wiki_tree(base_url, space_id, wiki_token)
+        else:
+            self.logger.warning(f"Could not extract space_id ({space_id}) or wiki_token ({wiki_token})")
+            return []
 
     def _normalize_url(self, url: str) -> str:
         """
