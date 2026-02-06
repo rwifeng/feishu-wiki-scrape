@@ -43,19 +43,8 @@ print()
 
 # Format as Firecrawl response
 if results_with_metadata:
-    # Convert to simple format first for format_as_firecrawl
-    simple_results = [
-        {
-            "url": r["metadata"]["url"],
-            "title": r["metadata"]["title"],
-            "markdown": r["markdown"]
-        }
-        for r in results_with_metadata
-    ]
-    
-    firecrawl_response = scraper.format_as_firecrawl(simple_results, url)
-    # Replace data with full metadata version
-    firecrawl_response["data"] = results_with_metadata
+    # format_as_firecrawl now automatically handles metadata format
+    firecrawl_response = scraper.format_as_firecrawl(results_with_metadata, url)
     
     print("Firecrawl-compatible response structure:")
     print(f"  success: {firecrawl_response['success']}")
@@ -121,15 +110,8 @@ def crawl():
         include_sidebar=True
     )
     
-    # Format response
-    simple_results = [
-        {"url": r["metadata"]["url"], 
-         "title": r["metadata"]["title"], 
-         "markdown": r["markdown"]}
-        for r in results
-    ]
-    response = scraper.format_as_firecrawl(simple_results, url)
-    response["data"] = results
+    # Format response (automatically handles metadata format)
+    response = scraper.format_as_firecrawl(results, url)
     
     return jsonify(response)
 

@@ -121,16 +121,8 @@ def main():
                 print("No pages scraped. Check the URL and authentication.", file=sys.stderr)
                 return 1
             
-            # Format as Firecrawl response
-            firecrawl_response = scraper.format_as_firecrawl(
-                [{"url": r["metadata"]["url"], 
-                  "title": r["metadata"]["title"], 
-                  "markdown": r["markdown"]} 
-                 for r in results_with_metadata],
-                args.url
-            )
-            # Replace data with full metadata version
-            firecrawl_response["data"] = results_with_metadata
+            # Format as Firecrawl response (automatically handles metadata format)
+            firecrawl_response = scraper.format_as_firecrawl(results_with_metadata, args.url)
             
             # Always output as JSON for Firecrawl format
             print(json.dumps(firecrawl_response, indent=2, ensure_ascii=False))

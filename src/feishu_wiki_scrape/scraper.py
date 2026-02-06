@@ -444,34 +444,46 @@ class FeishuWikiScraper:
 
     def format_as_firecrawl(
         self,
-        results: List[Dict[str, str]],
+        results: List[Dict[str, Any]],
         start_url: str,
         status: str = "completed",
     ) -> Dict[str, Any]:
         """
         Format scraping results in Firecrawl-compatible JSON format.
         
+        Accepts results from either scrape_wiki() or scrape_wiki_with_metadata().
+        
         Args:
-            results: List of page dictionaries with 'url', 'title', and 'markdown' keys
+            results: List of page dictionaries. Can be either:
+                     - Simple format: {'url', 'title', 'markdown'} from scrape_wiki()
+                     - Full format: {'markdown', 'metadata'} from scrape_wiki_with_metadata()
             start_url: The starting URL that was scraped
             status: Status of the scraping operation (default: "completed")
             
         Returns:
             Dictionary in Firecrawl-compatible format with success, status, data, etc.
         """
-        # Convert simple format to Firecrawl format with metadata
         data = []
         for page in results:
-            data.append({
-                "markdown": page.get("markdown", ""),
-                "metadata": {
-                    "url": page.get("url", ""),
-                    "title": page.get("title", "Untitled"),
-                    "sourceURL": page.get("url", ""),
-                    "statusCode": 200,
-                    "contentType": "text/html; charset=utf-8",
-                }
-            })
+            # Check if this is already in full metadata format
+            if "metadata" in page:
+                # Already has metadata, use as-is
+                data.append({
+                    "markdown": page.get("markdown", ""),
+                    "metadata": page["metadata"]
+                })
+            else:
+                # Convert simple format to Firecrawl format with basic metadata
+                data.append({
+                    "markdown": page.get("markdown", ""),
+                    "metadata": {
+                        "url": page.get("url", ""),
+                        "title": page.get("title", "Untitled"),
+                        "sourceURL": page.get("url", ""),
+                        "statusCode": 200,
+                        "contentType": "text/html; charset=utf-8",
+                    }
+                })
         
         return {
             "success": True,

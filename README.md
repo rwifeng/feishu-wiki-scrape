@@ -167,15 +167,8 @@ results = scraper.scrape_wiki_with_metadata(
     include_sidebar=True
 )
 
-# Format as Firecrawl response
-simple_results = [
-    {"url": r["metadata"]["url"], 
-     "title": r["metadata"]["title"], 
-     "markdown": r["markdown"]}
-    for r in results
-]
-firecrawl_response = scraper.format_as_firecrawl(simple_results, start_url)
-firecrawl_response["data"] = results  # Use full metadata
+# Format as Firecrawl response (automatically handles metadata format)
+firecrawl_response = scraper.format_as_firecrawl(results, start_url)
 
 print(firecrawl_response)
 ```
