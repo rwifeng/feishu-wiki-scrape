@@ -2,11 +2,13 @@
 Core scraper implementation for Feishu wiki pages
 """
 
+import os
+import re
 import requests
 from bs4 import BeautifulSoup
 import html2text
 from urllib.parse import urljoin, urlparse, urlunparse
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 from collections import deque
 import logging
 import time
@@ -286,6 +288,10 @@ class FeishuWikiScraper:
                 self.logger.warning(f"Wiki tree API error: code={code}, msg={data.get('msg')}. Authentication may be required.")
                 return []
             
+            # Store raw tree data for directory mode
+            self._last_tree_data = data
+            self._last_tree_parsed = urlparse(base_url)
+            
             # Extract all wiki tokens from the tree
             urls = self._parse_wiki_tree(data, parsed.scheme, parsed.netloc)
             self.logger.info(f"Found {len(urls)} pages in wiki tree")
@@ -353,6 +359,64 @@ class FeishuWikiScraper:
                     add_token(url_token)
         
         return urls
+
+    def _parse_wiki_tree_structure(self, data: Dict, scheme: str, netloc: str) -> Dict[str, Any]:
+        """
+        Parse wiki tree API response and preserve the full tree structure.
+        
+        Returns:
+            Dictionary with:
+                'root_list': list of root token strings
+                'child_map': dict mapping parent_token -> [child_tokens]
+                'nodes': dict mapping token -> {'title': str, 'url': str, ...}
+                'space_name': optional space name string
+        """
+        tree_data = data.get('data', {}).get('tree', {})
+        if not tree_data:
+            return {'root_list': [], 'child_map': {}, 'nodes': {}, 'space_name': ''}
+        
+        root_list = tree_data.get('root_list', [])
+        child_map = dict(tree_data.get('child_map', {}))  # mutable copy
+        raw_nodes = tree_data.get('nodes', {})
+        
+        # Try to extract space name
+        space_name = ''
+        space_info = data.get('data', {}).get('space', {})
+        if isinstance(space_info, dict):
+            space_name = space_info.get('name', '') or space_info.get('space_name', '')
+        
+        nodes = {}
+        for token, node_info in raw_nodes.items():
+            if isinstance(node_info, dict):
+                title = node_info.get('title', '') or node_info.get('name', '') or token
+                nodes[token] = {
+                    'title': title,
+                    'url': f"{scheme}://{netloc}/wiki/{token}",
+                    'obj_token': node_info.get('obj_token', ''),
+                    'obj_type': node_info.get('obj_type', ''),
+                    'has_child': node_info.get('has_child', False),
+                    'parent_wiki_token': node_info.get('parent_wiki_token', ''),
+                }
+        
+        # Rebuild child_map from parent_wiki_token if child_map is incomplete
+        # This fixes the case where the API returns nodes with parent info
+        # but doesn't fully populate child_map for deeper levels
+        for token, node in nodes.items():
+            parent = node.get('parent_wiki_token', '')
+            if parent:
+                if parent not in child_map:
+                    child_map[parent] = []
+                if token not in child_map[parent]:
+                    child_map[parent].append(token)
+        
+        self.logger.debug(f"Tree structure: {len(nodes)} nodes, {len(child_map)} parents in child_map, roots={root_list}")
+        
+        return {
+            'root_list': root_list,
+            'child_map': child_map,
+            'nodes': nodes,
+            'space_name': space_name,
+        }
     
     def _parse_wiki_tree_fallback(self, data: Dict, scheme: str, netloc: str) -> List[str]:
         """
@@ -867,3 +931,407 @@ class FeishuWikiScraper:
         except OSError as e:
             self.logger.error(f"Failed to write output file '{output_file}': {e}")
             raise
+
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        """
+        Sanitize a string for use as a filename.
+        Removes or replaces characters that are invalid in file paths.
+        """
+        # Replace path separators and other problematic chars
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+        # Collapse multiple underscores/spaces
+        name = re.sub(r'_+', '_', name).strip('_ ')
+        # Fallback if empty
+        return name or 'Untitled'
+
+    def _get_wiki_tree_structure(self, start_url: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch and return the wiki tree structure with parent-child relationships.
+        Recursively expands subtrees for nodes that have children but aren't
+        fully represented in child_map.
+        
+        Args:
+            start_url: Starting URL of the wiki
+            
+        Returns:
+            Tree structure dict or None if API fails
+        """
+        soup = self.fetch_page(start_url)
+        if not soup:
+            return None
+        
+        wiki_token = self._extract_wiki_token(start_url)
+        space_id = self._extract_space_id_from_page(soup)
+        
+        if not wiki_token or not space_id:
+            self.logger.warning("Could not extract space_id or wiki_token for tree structure")
+            return None
+        
+        parsed = urlparse(start_url)
+        api_url = f"{parsed.scheme}://{parsed.netloc}/space/api/wiki/v2/tree/get_info/"
+        
+        params = {
+            'space_id': space_id,
+            'with_space': 'true',
+            'with_perm': 'true',
+            'expand_shortcut': 'true',
+            'need_shared': 'true',
+            'exclude_fields': '5',
+            'with_deleted': 'true',
+            'wiki_token': wiki_token,
+        }
+        
+        try:
+            response = self.session.get(api_url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            
+            code = data.get('code')
+            if code is not None and code != 0:
+                self.logger.warning(f"Wiki tree API error: code={code}")
+                return None
+            
+            tree_info = self._parse_wiki_tree_structure(data, parsed.scheme, parsed.netloc)
+            
+            # Recursively expand nodes that claim to have children
+            # but whose children are not yet in child_map
+            self._expand_incomplete_subtrees(
+                tree_info, api_url, space_id, parsed.scheme, parsed.netloc
+            )
+            
+            return tree_info
+        except Exception as e:
+            self.logger.warning(f"Failed to get wiki tree structure: {e}")
+            return None
+
+    def _expand_incomplete_subtrees(
+        self,
+        tree_info: Dict[str, Any],
+        api_url: str,
+        space_id: str,
+        scheme: str,
+        netloc: str,
+    ):
+        """
+        For nodes with has_child=True that are not in child_map,
+        fetch their subtree from the API and merge into tree_info.
+        """
+        nodes = tree_info['nodes']
+        child_map = tree_info['child_map']
+        
+        # Find nodes that claim children but have no entries in child_map
+        to_expand = []
+        for token, node in nodes.items():
+            if node.get('has_child') and token not in child_map:
+                to_expand.append(token)
+        
+        if not to_expand:
+            return
+        
+        self.logger.info(f"Expanding {len(to_expand)} subtrees with missing children...")
+        
+        for token in to_expand:
+            try:
+                time.sleep(self.delay * 0.5)  # lighter delay for API calls
+                params = {
+                    'space_id': space_id,
+                    'with_space': 'false',
+                    'with_perm': 'true',
+                    'expand_shortcut': 'true',
+                    'need_shared': 'true',
+                    'exclude_fields': '5',
+                    'with_deleted': 'true',
+                    'wiki_token': token,
+                }
+                response = self.session.get(api_url, params=params, timeout=self.timeout)
+                response.raise_for_status()
+                data = response.json()
+                
+                code = data.get('code')
+                if code is not None and code != 0:
+                    continue
+                
+                sub_tree = self._parse_wiki_tree_structure(data, scheme, netloc)
+                
+                # Merge child_map
+                for parent, children in sub_tree['child_map'].items():
+                    if parent not in child_map:
+                        child_map[parent] = []
+                    for child in children:
+                        if child not in child_map[parent]:
+                            child_map[parent].append(child)
+                
+                # Merge nodes
+                for t, node_info in sub_tree['nodes'].items():
+                    if t not in nodes:
+                        nodes[t] = node_info
+                
+                self.logger.debug(f"Expanded subtree for {token}: +{len(sub_tree['nodes'])} nodes")
+                
+            except Exception as e:
+                self.logger.debug(f"Failed to expand subtree for {token}: {e}")
+
+    def _compute_tree_paths(self, tree_info: Dict[str, Any], skip_root: Optional[str] = None) -> Dict[str, List[str]]:
+        """
+        Compute the directory path segments for each wiki token based on tree structure.
+        
+        Args:
+            tree_info: Tree structure from _parse_wiki_tree_structure()
+            skip_root: Optional token whose level should be omitted from paths
+                       (e.g., the space root container)
+            
+        Returns:
+            Dict mapping wiki_token -> list of path segment strings (titles)
+            e.g. {'tokenA': ['RootTitle'], 'tokenB': ['RootTitle', 'ChildTitle']}
+        """
+        root_list = tree_info['root_list']
+        child_map = tree_info['child_map']
+        nodes = tree_info['nodes']
+        
+        # Build parent map from child_map
+        parent_map: Dict[str, Optional[str]] = {}
+        for parent_token, children in child_map.items():
+            for child_token in children:
+                parent_map[child_token] = parent_token
+        
+        # Supplement with parent_wiki_token from node data
+        for token, node in nodes.items():
+            parent = node.get('parent_wiki_token', '')
+            if parent and token not in parent_map:
+                parent_map[token] = parent
+        
+        # Roots have no parent
+        for root_token in root_list:
+            if root_token not in parent_map:
+                parent_map[root_token] = None
+        
+        def get_title(token: str) -> str:
+            node = nodes.get(token)
+            if node:
+                return self._sanitize_filename(node.get('title', '') or token)
+            return self._sanitize_filename(token)
+        
+        def get_path_segments(token: str) -> List[str]:
+            """Walk up the tree to build path from root to this node."""
+            segments = []
+            current = token
+            visited = set()
+            while current is not None and current not in visited:
+                visited.add(current)
+                # Skip the space root level if requested
+                if current != skip_root:
+                    segments.append(get_title(current))
+                current = parent_map.get(current)
+            segments.reverse()
+            return segments
+        
+        paths = {}
+        for token in nodes:
+            segs = get_path_segments(token)
+            if segs:  # Only add if there are segments after skipping root
+                paths[token] = segs
+        
+        return paths
+
+    def scrape_wiki_to_directory(
+        self,
+        start_url: str,
+        output_dir: str,
+        max_pages: Optional[int] = None,
+    ) -> int:
+        """
+        Scrape wiki and save each page as a separate .md file preserving tree structure.
+        
+        Pages with children become directories with an index.md inside.
+        The directory hierarchy mirrors the wiki's sidebar tree.
+        
+        Args:
+            start_url: Starting URL of the wiki
+            output_dir: Root output directory
+            max_pages: Maximum number of pages to scrape (None for unlimited)
+            
+        Returns:
+            Number of pages saved
+        """
+        start_url = self._normalize_url(start_url)
+        
+        # Step 1: Get tree structure
+        tree_info = self._get_wiki_tree_structure(start_url)
+        
+        if tree_info and tree_info['nodes']:
+            return self._scrape_with_tree(start_url, output_dir, tree_info, max_pages)
+        else:
+            # Fallback: flat scrape without tree (no API access / not a feishu site)
+            self.logger.warning("Could not get tree structure, falling back to flat directory output")
+            return self._scrape_flat_directory(start_url, output_dir, max_pages)
+
+    def _scrape_with_tree(
+        self,
+        start_url: str,
+        output_dir: str,
+        tree_info: Dict[str, Any],
+        max_pages: Optional[int],
+    ) -> int:
+        """
+        Scrape pages using known tree structure, saving into nested directories.
+        """
+        nodes = tree_info['nodes']
+        child_map = tree_info['child_map']
+        root_list = tree_info['root_list']
+        
+        # Detect space root container: a token that is parent of root_list items
+        # in child_map but is NOT itself in root_list.  This is the wiki space
+        # wrapper node; the user's -o dir should map to this level.
+        skip_root = None
+        
+        # Strategy 1: single-element root_list with no title
+        if len(root_list) == 1:
+            root_token = root_list[0]
+            root_node = nodes.get(root_token, {})
+            root_title = root_node.get('title', '')
+            if not root_title or root_title == root_token:
+                skip_root = root_token
+        
+        # Strategy 2: find a token that contains root_list items as children
+        # but is NOT itself in root_list (the space-level wrapper)
+        if not skip_root and root_list:
+            root_set = set(root_list)
+            for parent_token, children in child_map.items():
+                if parent_token not in root_set and root_set.issubset(set(children)):
+                    skip_root = parent_token
+                    break
+        
+        if skip_root:
+            self.logger.info(f"Skipping space root container: {skip_root}")
+        
+        token_paths = self._compute_tree_paths(tree_info, skip_root=skip_root)
+        
+        # Determine which tokens have children (they become directories)
+        tokens_with_children = set()
+        for parent_token, children in child_map.items():
+            if children:
+                tokens_with_children.add(parent_token)
+        # Also mark parents discovered via parent_wiki_token
+        for token, node in nodes.items():
+            parent = node.get('parent_wiki_token', '')
+            if parent and parent in nodes:
+                tokens_with_children.add(parent)
+        
+        # Collect all tokens via BFS, then append any orphans from nodes
+        all_tokens = []
+        seen = set()
+        queue = deque(root_list)
+        while queue:
+            token = queue.popleft()
+            if token in seen:
+                continue
+            seen.add(token)
+            all_tokens.append(token)
+            for child in child_map.get(token, []):
+                queue.append(child)
+        
+        # Add any nodes NOT reached by BFS (orphans from incomplete child_map)
+        for token in nodes:
+            if token not in seen:
+                all_tokens.append(token)
+                seen.add(token)
+        
+        os.makedirs(output_dir, exist_ok=True)
+        count = 0
+        
+        for token in all_tokens:
+            if max_pages is not None and count >= max_pages:
+                break
+            
+            # Skip the space root container itself (don't scrape it)
+            if token == skip_root:
+                continue
+            
+            node = nodes.get(token, {})
+            url = node.get('url', '')
+            if not url:
+                continue
+            
+            # Scrape the page
+            page_data = self.scrape_page(url)
+            if not page_data:
+                continue
+            
+            page_data.pop('_soup', None)
+            title = self._sanitize_filename(page_data.get('title', '') or node.get('title', '') or 'Untitled')
+            markdown_content = f"# {page_data['title']}\n\nSource: {page_data['url']}\n\n{page_data['markdown']}\n"
+            
+            # Build file path from tree path
+            path_segments = token_paths.get(token, [title])
+            if not path_segments:
+                path_segments = [title]
+            
+            if token in tokens_with_children:
+                # This node has children: create dir and save as index.md
+                dir_path = os.path.join(output_dir, *path_segments)
+                os.makedirs(dir_path, exist_ok=True)
+                file_path = os.path.join(dir_path, 'index.md')
+            else:
+                # Leaf node: save as title.md inside parent directory
+                if len(path_segments) > 1:
+                    parent_dir = os.path.join(output_dir, *path_segments[:-1])
+                else:
+                    parent_dir = output_dir
+                os.makedirs(parent_dir, exist_ok=True)
+                file_path = os.path.join(parent_dir, f"{path_segments[-1]}.md")
+            
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(markdown_content)
+                count += 1
+                self.logger.info(f"Saved: {file_path} ({count} pages)")
+            except OSError as e:
+                self.logger.error(f"Failed to write {file_path}: {e}")
+            
+            # Be polite
+            time.sleep(self.delay)
+        
+        self.logger.info(f"Scraping complete. Saved {count} pages to {output_dir}")
+        return count
+
+    def _scrape_flat_directory(
+        self,
+        start_url: str,
+        output_dir: str,
+        max_pages: Optional[int],
+    ) -> int:
+        """
+        Fallback: scrape pages and save them flat in a single directory.
+        """
+        results = self.scrape_wiki(
+            start_url=start_url,
+            max_pages=max_pages,
+            include_sidebar=True,
+        )
+        
+        os.makedirs(output_dir, exist_ok=True)
+        count = 0
+        
+        for page in results:
+            title = self._sanitize_filename(page.get('title', 'Untitled'))
+            file_path = os.path.join(output_dir, f"{title}.md")
+            
+            # Avoid overwriting: append number if needed
+            base_path = file_path
+            i = 1
+            while os.path.exists(file_path):
+                file_path = base_path.replace('.md', f'_{i}.md')
+                i += 1
+            
+            markdown_content = f"# {page['title']}\n\nSource: {page['url']}\n\n{page['markdown']}\n"
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(markdown_content)
+                count += 1
+                self.logger.info(f"Saved: {file_path}")
+            except OSError as e:
+                self.logger.error(f"Failed to write {file_path}: {e}")
+        
+        self.logger.info(f"Saved {count} pages to {output_dir}")
+        return count

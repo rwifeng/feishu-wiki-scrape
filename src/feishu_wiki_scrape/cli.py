@@ -5,6 +5,7 @@ Command-line interface for Feishu Wiki Scraper
 import argparse
 import json
 import logging
+import os
 import sys
 from .scraper import FeishuWikiScraper
 
@@ -29,6 +30,23 @@ def validate_positive_float(value):
         raise argparse.ArgumentTypeError(f"{value} is not a valid number")
 
 
+def _is_directory_output(path: str) -> bool:
+    """
+    Determine whether the output path should be treated as a directory.
+    True if the path ends with '/', is an existing directory, or has no
+    file extension (e.g. './tmp', 'output_dir').
+    """
+    if path.endswith('/') or path.endswith(os.sep):
+        return True
+    if os.path.isdir(path):
+        return True
+    # No file extension → treat as directory
+    _, ext = os.path.splitext(os.path.basename(path))
+    if not ext:
+        return True
+    return False
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -39,7 +57,7 @@ def main():
         "-o",
         "--output",
         default="output.md",
-        help="Output file path (default: output.md)",
+        help="Output file path (default: output.md). If path ends with '/' it saves as a directory tree with one .md file per page.",
     )
     parser.add_argument(
         "--max-pages",
@@ -126,6 +144,17 @@ def main():
             
             # Always output as JSON for Firecrawl format
             print(json.dumps(firecrawl_response, indent=2, ensure_ascii=False))
+        elif _is_directory_output(args.output):
+            # Directory mode: save each page as a separate .md file in tree structure
+            count = scraper.scrape_wiki_to_directory(
+                start_url=args.url,
+                output_dir=args.output,
+                max_pages=args.max_pages,
+            )
+            if count == 0:
+                print("No pages scraped. Check the URL and authentication.", file=sys.stderr)
+                return 1
+            print(f"Successfully scraped {count} pages to {args.output}")
         else:
             # Standard scraping
             results = scraper.scrape_wiki(
