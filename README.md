@@ -10,6 +10,7 @@ A Python library to scrape Feishu (飞书) wiki pages and convert them to Markdo
 - 🍪 Support for authentication via cookies and custom headers
 - ⚙️ Configurable scraping options (delays, max pages, etc.)
 - 💾 Export to Markdown files or JSON format
+- 📂 **Directory output mode** — save each page as a separate `.md` file preserving wiki tree structure
 - 🎯 Command-line interface for easy usage
 - 🔥 **Firecrawl-compatible JSON output with metadata**
 
@@ -36,12 +37,16 @@ pip install -r requirements.txt
 Basic usage to scrape a Feishu wiki:
 
 ```bash
+# Save to a single Markdown file
 feishu-wiki-scrape https://zcn3fx96oxg4.feishu.cn/wiki/H5V5wMczPif5A5khSG3cWx65nbc -o output.md
+
+# Save as a directory tree (one .md file per page, preserving wiki structure)
+feishu-wiki-scrape https://zcn3fx96oxg4.feishu.cn/wiki/H5V5wMczPif5A5khSG3cWx65nbc -o ./wiki-docs/
 ```
 
 #### Options
 
-- `-o, --output`: Output file path (default: `output.md`)
+- `-o, --output`: Output path (default: `output.md`). If the path ends with `/`, is an existing directory, or has no file extension, each page is saved as a separate `.md` file in a nested directory tree matching the wiki structure
 - `--max-pages`: Maximum number of pages to scrape (default: unlimited)
 - `--no-sidebar`: Don't follow sidebar links (scrape only the given URL)
 - `--delay`: Delay between requests in seconds (default: 1.0)
@@ -76,6 +81,23 @@ feishu-wiki-scrape https://example.feishu.cn/wiki/page \
 Output as JSON:
 ```bash
 feishu-wiki-scrape https://example.feishu.cn/wiki/page --json-output > output.json
+```
+
+Save as directory tree preserving wiki structure:
+```bash
+feishu-wiki-scrape https://example.feishu.cn/wiki/page -o ./docs/
+```
+
+This produces a directory tree like:
+```
+docs/
+  🚀 Introduction/
+    index.md          # parent page with children
+    Getting Started.md
+  FAQ/
+    index.md
+    Common Errors.md
+  Claude.md           # leaf page (no children)
 ```
 
 ### Python API
@@ -114,6 +136,14 @@ scraper.scrape_to_file(
     max_pages=None,         # No limit
     include_sidebar=True
 )
+
+# Save to directory tree (preserves wiki sidebar structure)
+count = scraper.scrape_wiki_to_directory(
+    start_url="https://example.feishu.cn/wiki/page",
+    output_dir="./docs/",
+    max_pages=None          # No limit
+)
+print(f"Saved {count} pages")
 ```
 
 ### Firecrawl-Compatible Output
@@ -204,12 +234,20 @@ feishu-wiki-scrape https://example.feishu.cn/wiki/page \
 
 ## Output Format
 
-### Markdown File
+### Single Markdown File (`-o output.md`)
 
 Pages are separated by horizontal rules (`---`) with each page containing:
 - Page title as H1 heading
 - Source URL
 - Markdown content
+
+### Directory Tree (`-o dir/`)
+
+Each wiki page is saved as a separate `.md` file. The directory structure mirrors the wiki's sidebar tree:
+
+- **Pages with children** become a directory containing `index.md` (the page content) plus child pages
+- **Leaf pages** (no children) are saved as `{title}.md` in the parent directory
+- The wiki space root container is skipped so the output directory maps directly to the top-level pages
 
 ### JSON Format
 
