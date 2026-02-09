@@ -1134,6 +1134,186 @@ class FeishuWikiScraper:
         
         return paths
 
+    def _compute_tree_title_paths(self, tree_info: Dict[str, Any], skip_root: Optional[str] = None) -> Dict[str, List[str]]:
+        """
+        Compute the title path segments for each wiki token based on tree structure.
+        Unlike _compute_tree_paths, this preserves original titles without filename sanitization.
+
+        Args:
+            tree_info: Tree structure from _parse_wiki_tree_structure()
+            skip_root: Optional token whose level should be omitted from paths
+
+        Returns:
+            Dict mapping wiki_token -> list of title strings
+            e.g. {'tokenA': ['Root Title'], 'tokenB': ['Root Title', 'Child Title']}
+        """
+        root_list = tree_info['root_list']
+        child_map = tree_info['child_map']
+        nodes = tree_info['nodes']
+
+        # Build parent map from child_map
+        parent_map: Dict[str, Optional[str]] = {}
+        for parent_token, children in child_map.items():
+            for child_token in children:
+                parent_map[child_token] = parent_token
+
+        # Supplement with parent_wiki_token from node data
+        for token, node in nodes.items():
+            parent = node.get('parent_wiki_token', '')
+            if parent and token not in parent_map:
+                parent_map[token] = parent
+
+        # Roots have no parent
+        for root_token in root_list:
+            if root_token not in parent_map:
+                parent_map[root_token] = None
+
+        def get_title(token: str) -> str:
+            node = nodes.get(token)
+            if node:
+                return node.get('title', '') or token
+            return token
+
+        def get_path_segments(token: str) -> List[str]:
+            """Walk up the tree to build title path from root to this node."""
+            segments = []
+            current = token
+            visited = set()
+            while current is not None and current not in visited:
+                visited.add(current)
+                if current != skip_root:
+                    segments.append(get_title(current))
+                current = parent_map.get(current)
+            segments.reverse()
+            return segments
+
+        paths = {}
+        for token in nodes:
+            segs = get_path_segments(token)
+            if segs:
+                paths[token] = segs
+
+        return paths
+
+    def scrape_wiki_firecrawl(
+        self,
+        start_url: str,
+        max_pages: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Scrape a Feishu wiki and return results in Firecrawl-compatible format
+        with hierarchical titles derived from the wiki tree structure.
+
+        Title format: "Sub Dir > Page Title" (root name is excluded)
+        Falls back to regular scraping if tree structure is unavailable.
+
+        Args:
+            start_url: Starting URL of the wiki
+            max_pages: Maximum number of pages to scrape
+
+        Returns:
+            Firecrawl-compatible dict with 'success', 'status', 'data', etc.
+        """
+        start_url = self._normalize_url(start_url)
+
+        # Step 1: Get tree structure
+        tree_info = self._get_wiki_tree_structure(start_url)
+
+        if not tree_info or not tree_info['nodes']:
+            # Fallback: regular scrape without tree hierarchy
+            self.logger.warning("Could not get tree structure, falling back to regular scraping")
+            results = self.scrape_wiki_with_metadata(start_url, max_pages)
+            return self.format_as_firecrawl(results, start_url)
+
+        nodes = tree_info['nodes']
+        child_map = tree_info['child_map']
+        root_list = tree_info['root_list']
+        space_name = tree_info.get('space_name', '')
+
+        # Detect skip_root (space root container with no meaningful title)
+        skip_root = None
+        if len(root_list) == 1:
+            root_token = root_list[0]
+            root_node = nodes.get(root_token, {})
+            root_title = root_node.get('title', '')
+            if not root_title or root_title == root_token:
+                skip_root = root_token
+
+        if not skip_root and root_list:
+            root_set = set(root_list)
+            for parent_token, children in child_map.items():
+                if parent_token not in root_set and root_set.issubset(set(children)):
+                    skip_root = parent_token
+                    break
+
+        if skip_root:
+            self.logger.info(f"Skipping space root container: {skip_root}")
+
+        # Step 2: Compute title paths (without filename sanitization)
+        title_paths = self._compute_tree_title_paths(tree_info, skip_root=skip_root)
+
+        # Step 3: Collect all tokens via BFS
+        all_tokens = []
+        seen = set()
+        queue = deque(root_list)
+        while queue:
+            token = queue.popleft()
+            if token in seen:
+                continue
+            seen.add(token)
+            all_tokens.append(token)
+            for child in child_map.get(token, []):
+                queue.append(child)
+
+        # Add orphans not reached by BFS
+        for token in nodes:
+            if token not in seen:
+                all_tokens.append(token)
+                seen.add(token)
+
+        # Step 4: Scrape pages with hierarchical titles
+        results = []
+        for token in all_tokens:
+            if max_pages is not None and len(results) >= max_pages:
+                break
+
+            if token == skip_root:
+                continue
+
+            node = nodes.get(token, {})
+            url = node.get('url', '')
+            if not url:
+                continue
+
+            page_data = self.scrape_page_with_metadata(url)
+            if not page_data:
+                continue
+
+            page_data.pop('_soup', None)
+
+            # Build hierarchical title: "Sub Dir > Page Title"
+            # skip_root already removes the unnamed space container,
+            # so title_segments starts from the first real page — use all of them.
+            title_segments = title_paths.get(token)
+            if title_segments:
+                hierarchical_title = ' > '.join(title_segments)
+            else:
+                # Not in tree - use tree node title, then HTML title as last resort
+                node_title = node.get('title', '')
+                hierarchical_title = node_title or page_data.get('metadata', {}).get('title', 'Untitled')
+
+            page_data['metadata']['title'] = hierarchical_title
+            results.append(page_data)
+
+            self.logger.info(f"Scraped: {hierarchical_title} ({len(results)} pages)")
+
+            # Rate limiting
+            if max_pages is None or len(results) < max_pages:
+                time.sleep(self.delay)
+
+        self.logger.info(f"Scraping complete. Total pages: {len(results)}")
+        return self.format_as_firecrawl(results, start_url)
+
     def scrape_wiki_to_directory(
         self,
         start_url: str,
